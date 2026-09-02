@@ -1,5 +1,6 @@
 FROM python:3.10-slim
 
+# System level packages
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-hin \
@@ -8,11 +9,17 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Non-root user banakar permission set karna
+RUN useradd -m botuser
+USER botuser
+ENV PATH="/home/botuser/.local/bin:$PATH"
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /home/botuser/app
 
-COPY . .
+COPY --chown=botuser:botuser requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY --chown=botuser:botuser . .
 
 CMD ["python", "bot.py"]
