@@ -53,7 +53,7 @@ threading.Thread(target=start_health_server, daemon=True).start()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 QUIZ_TIMER_SECONDS = 15  # Official QuizBot standard timer
 
 logging.basicConfig(
