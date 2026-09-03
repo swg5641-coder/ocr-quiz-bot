@@ -5,7 +5,6 @@ import asyncio
 import random
 import threading
 import time
-import re
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -30,7 +29,7 @@ from google import genai
 from google.genai import types
 
 # ============================================================
-# 1. RENDER HEALTH-CHECK SERVER & 24/7 SELF-PING
+# 1. RENDER HEALTH SERVER & 24/7 SELF-PING
 # ============================================================
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -58,9 +57,8 @@ def start_health_server():
 threading.Thread(target=start_health_server, daemon=True).start()
 
 def keep_alive_ping():
-    """Har 10 minute me server ko ping karke Render ko 24 ghante active rakhega."""
+    """Har 10 minute me Render URL ko ping karke bot ko 24 ghante jagaye rakhega."""
     time.sleep(30)
-    # Aapka exact Render Link set kar diya gaya hai
     url = "https://ocr-quiz-bot.onrender.com"
     while True:
         try:
@@ -73,14 +71,14 @@ def keep_alive_ping():
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 # ============================================================
-# 2. CONFIG & CREDENTIALS
+# 2. CONFIG & CREDENTIALS (GEMINI 3.5 MODELS)
 # ============================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
-FAST_GK_MODEL = "gemini-2.5-flash"
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
+FAST_GK_MODEL = "gemini-3.5-flash"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -119,7 +117,7 @@ async def safe_reply(message_or_query, text: str, reply_markup=None, parse_mode=
     try:
         return await message_or_query.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception as e:
-        logger.warning(f"Markdown send failed, retrying as plain text: {e}")
+        logger.warning(f"Markdown send failed, retrying plain text: {e}")
         try:
             return await message_or_query.reply_text(text, reply_markup=reply_markup)
         except Exception as e2:
@@ -207,7 +205,7 @@ def parse_with_gemini(part: types.Part, language: str = "en"):
             logger.warning(f"Model {model_name} failed: {e}. Trying fallback...")
             continue
 
-    raise RuntimeError(f"All AI models failed: {last_error}")
+    raise RuntimeError(f"All AI models busy: {last_error}")
 
 def ask_gk_fast(question_text: str, language: str = "hi") -> str:
     if not gemini_client:
@@ -286,7 +284,7 @@ def sanitize_and_prepare(data: dict, shuffle_enabled: bool):
     return title, valid
 
 # ============================================================
-# 5. COMMANDS & BUTTONS
+# 5. COMMANDS & SETTINGS
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,11 +294,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         "👋 *Swagat hai Quiz Master Bot me!*\n\n"
-        "Aapke typing bar ke upar saare options diye gaye hain:\n"
-        "• 📸 *Scan Quiz* - Photo se instant quiz\n"
-        "• ✍️ *Text Bulk Quiz* - 50-200 questions paste karein\n"
-        "• 🧠 *GK/GS & Static GK* - Koi bhi GK question puchein (Fast reply)\n"
-        "• ⚙️ *Quiz Settings* - Timer badlein\n\n"
+        "Aapke options:\n"
+        "• 📸 *Scan Quiz* - Photo se instant quiz banayein\n"
+        "• ✍️ *Text Bulk Quiz* - Questions paste karein\n"
+        "• 🧠 *GK/GS & Static GK* - Fast AI doubt solving\n"
+        "• ⚙️ *Quiz Settings* - Timer aur negative marking badlein\n\n"
         f"⚙️ *Current Setting:* Timer: *{timer_display}* | Negative: *{'-0.25' if cfg['negative'] else 'OFF'}*"
     )
     await safe_reply(update.message, welcome_text, reply_markup=get_main_keyboard())
@@ -317,7 +315,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔀 *Shuffle Questions:* {'✅ ON' if cfg['shuffle'] else '❌ OFF'}\n"
         f"⚠️ *Negative Marking (-0.25):* {'✅ ON' if cfg['negative'] else '❌ OFF'}\n"
         f"🌐 *Quiz/GK Language:* {lang_display}\n\n"
-        "Neeche buttons se apna pasandida mode select karein:"
+        "Option select karein:"
     )
 
     markup = InlineKeyboardMarkup([
@@ -357,7 +355,7 @@ async def stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Quiz stop kar diya gaya hai.", reply_markup=get_main_keyboard())
 
 # ============================================================
-# 6. INPUT DISPATCHER
+# 6. INPUT HANDLER
 # ============================================================
 
 async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,15 +368,15 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📸 Scan Quiz":
         context.user_data["mode"] = "AWAITING_IMAGE"
-        await safe_reply(update.message, "📸 *Book page ya question paper ki saaf photo bhejiye.*")
+        await safe_reply(update.message, "📸 *Book page ya question paper ki photo bhejiye.*")
         return
     elif text == "✍️ Text Bulk Quiz":
         context.user_data["mode"] = "AWAITING_TEXT"
-        await safe_reply(update.message, "✍️ *Questions yahan text me paste karein ya `.txt` file upload karein.*")
+        await safe_reply(update.message, "✍️ *Questions yahan text me paste karein ya `.txt` file bhejein.*")
         return
     elif text == "🧠 GK/GS & Static GK Doubt":
         context.user_data["mode"] = "GK_DOUBT"
-        await safe_reply(update.message, "🧠 *GK/GS Fast Assistant Active:*\nKoi bhi GK sawal type karein, instant jawab milega.")
+        await safe_reply(update.message, "🧠 *GK/GS Fast Assistant Active:*\nSawál bhejein, direct answer milega.")
         return
     elif text == "⚙️ Quiz Settings":
         await settings_command(update, context)
@@ -415,7 +413,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title, questions = sanitize_and_prepare(data, cfg["shuffle"])
 
             if not questions:
-                await status.edit_text("⚠️ Questions nahi ban sake. Image saaf bhejein.")
+                await status.edit_text("⚠️ Questions extract nahi ho sake. Photo clear bhejein.")
                 return
 
             await status.delete()
@@ -432,16 +430,16 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc = update.message.document
         file_name = doc.file_name or ""
         if not file_name.lower().endswith((".txt", ".text")):
-            await update.message.reply_text("⚠️ Kripya `.txt` file upload karein.")
+            await update.message.reply_text("⚠️ Kripya `.txt` file bhejein.")
             return
 
-        status = await update.message.reply_text("⚙️ Bulk questions read ho rahe hain...")
+        status = await update.message.reply_text("⚙️ Reading text file...")
         try:
             t_file = await doc.get_file()
             raw_bytes = await t_file.download_as_bytearray()
             content = bytes(raw_bytes).decode("utf-8", errors="ignore")
             if not content.strip():
-                await status.edit_text("⚠️ File khaali hai.")
+                await status.edit_text("⚠️ File empty hai.")
                 return
 
             part = types.Part.from_text(text=content)
@@ -449,7 +447,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title, questions = sanitize_and_prepare(data, cfg["shuffle"])
 
             if not questions:
-                await status.edit_text("⚠️ File me valid questions nahi mile.")
+                await status.edit_text("⚠️ File me questions nahi mile.")
                 return
 
             await status.delete()
@@ -464,14 +462,14 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text and not text.startswith("/"):
         if context.user_data.get("mode") == "AWAITING_TEXT":
-            status = await update.message.reply_text("⚙️ AI text analyze kar raha hai...")
+            status = await update.message.reply_text("⚙️ AI processing text...")
             try:
                 part = types.Part.from_text(text=text)
                 data = await asyncio.to_thread(parse_with_gemini, part, cfg["language"])
                 title, questions = sanitize_and_prepare(data, cfg["shuffle"])
 
                 if not questions:
-                    await status.edit_text("⚠️ Questions extract nahi ho sake.")
+                    await status.edit_text("⚠️ Valid questions nahi mile.")
                     return
 
                 await status.delete()
@@ -489,7 +487,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_ready_card(message, context: ContextTypes.DEFAULT_TYPE, user_id: int, title: str, questions: list):
     if not questions:
-        await message.reply_text("⚠️ Koi valid question nahi mila.")
+        await message.reply_text("⚠️ Koi question available nahi hai.")
         return
 
     cfg = get_settings(user_id)
@@ -506,7 +504,7 @@ async def setup_ready_card(message, context: ContextTypes.DEFAULT_TYPE, user_id:
     context.user_data["unanswered_count"] = 0
     context.user_data["user_id"] = user_id
 
-    timer_str = f"{cfg['timer']} seconds per question" if cfg['timer'] > 0 else "⚡ Bina Timer (Direct Click Mode)"
+    timer_str = f"{cfg['timer']} seconds per question" if cfg['timer'] > 0 else "⚡ Direct Next Mode"
 
     ready_text = (
         f"🎲 Get ready for the quiz *'{md_escape(title)}'*\n\n"
@@ -514,7 +512,7 @@ async def setup_ready_card(message, context: ContextTypes.DEFAULT_TYPE, user_id:
         f"⏱ *{timer_str}*\n"
         f"🔀 Shuffle: *{'ON' if cfg['shuffle'] else 'OFF'}*\n"
         f"⚠️ Negative Marking: *{'-0.25' if cfg['negative'] else 'OFF'}*\n\n"
-        f"🏁 Press the button below when you are ready.\n"
+        f"🏁 Start karne ke liye niche button dabayein.\n"
         f"Send /stop to cancel."
     )
     ready_markup = InlineKeyboardMarkup([
@@ -737,7 +735,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button_click))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    print("🤖 Ultra-Fast QuizBot & GK Assistant Running 24/7...")
+    print("🤖 Ultra-Fast QuizBot Running 24/7...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
