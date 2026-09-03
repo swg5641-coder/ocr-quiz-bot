@@ -63,8 +63,8 @@ threading.Thread(target=start_health_server, daemon=True).start()
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
-FAST_GK_MODEL = "gemini-2.5-flash"
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash"]
+FAST_GK_MODEL = "gemini-2.5-flash-lite"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -89,7 +89,10 @@ user_settings = {}
 
 def get_settings(user_id):
     if user_id not in user_settings:
-        user_settings[user_id] = {"timer": 15, "shuffle": True, "negative": False}
+        # language: "en" = English quiz, "hi" = Hindi quiz
+        user_settings[user_id] = {"timer": 15, "shuffle": True, "negative": False, "language": "en"}
+    if "language" not in user_settings[user_id]:
+        user_settings[user_id]["language"] = "en"
     return user_settings[user_id]
 
 def md_escape(text: str) -> str:
@@ -130,13 +133,14 @@ def get_main_keyboard():
 # 4. AI PROMPTS
 # ============================================================
 
-EXTRACT_PROMPT = r"""
+EXTRACT_PROMPT_BASE = r"""
 Extract multiple-choice questions from the provided input (image or text).
 Rules:
 1. Valid JSON only.
 2. Max 4 options per question.
 3. Question length max 280 chars, option length max 90 chars.
 4. Correct answer index must be 0, 1, 2, or 3.
+{LANGUAGE_RULE}
 Output format:
 {
   "title": "Quiz Assessment",
@@ -150,22 +154,41 @@ Output format:
 }
 """
 
-GK_PROMPT = r"""
+LANGUAGE_RULES = {
+    "en": "5. Write the title, every question, and every option strictly in English. If the source material is in Hindi or any other language, translate it into clear English.",
+    "hi": "5. Title, har question aur har option strictly हिंदी (Devanagari script) me likho. Agar source material English ya kisi aur bhasha me hai, to use pure Hindi me translate karke likho.",
+}
+
+def get_extract_prompt(language: str) -> str:
+    rule = LANGUAGE_RULES.get(language, LANGUAGE_RULES["en"])
+    return EXTRACT_PROMPT_BASE.replace("{LANGUAGE_RULE}", rule)
+
+GK_PROMPT_HI = r"""
 तुम एक बहुत तेज़ और सटीक GK/GS और Static GK शिक्षक हो।
 उपयोगकर्ता द्वारा पूछे गए सामान्य ज्ञान/सामान्य अध्ययन प्रश्न का उत्तर अत्यंत संक्षिप्त, बिंदुवार और सीधे शब्दों में 2-3 वाक्यों में हिंदी में दो।
 अनावश्यक भूमिका मत बनाओ। सीधे मुख्य तथ्य, वर्ष, नाम या कारण बताओ।
 """
 
-def parse_with_gemini(part: types.Part):
+GK_PROMPT_EN = r"""
+You are a very fast and accurate GK/GS and Static GK teacher.
+Answer the user's General Knowledge / General Studies question in extremely concise, point-wise, plain English in 2-3 sentences.
+Do not add unnecessary intro. Directly state the key facts, year, name, or reason.
+"""
+
+def get_gk_prompt(language: str) -> str:
+    return GK_PROMPT_EN if language == "en" else GK_PROMPT_HI
+
+def parse_with_gemini(part: types.Part, language: str = "en"):
     if not gemini_client:
         raise RuntimeError("GEMINI_API_KEY is not configured!")
 
+    prompt = get_extract_prompt(language)
     last_error = None
     for model_name in FALLBACK_MODELS:
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
-                contents=[part, EXTRACT_PROMPT],
+                contents=[part, prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
             if response and getattr(response, "text", None):
@@ -177,21 +200,32 @@ def parse_with_gemini(part: types.Part):
 
     raise RuntimeError(f"All AI models busy: {last_error}")
 
-def ask_gk_fast(question_text: str) -> str:
+def ask_gk_fast(question_text: str, language: str = "hi") -> str:
     if not gemini_client:
         return "❌ GEMINI_API_KEY set nahi hai."
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=FAST_GK_MODEL,
-            contents=[GK_PROMPT, question_text],
-        )
-        if response and getattr(response, "text", None):
-            return response.text.strip()
-        return "⚠️ Jawab nahi mil paya."
-    except Exception as e:
-        logger.error(f"GK fast error: {e}")
-        return "⚠️ Server busy hai, kripya dobara puchein."
+    prompt = get_gk_prompt(language)
+    last_error = None
+
+    # Try the fast model first, then fall back through the same models
+    # used for scanning so a single busy/invalid model doesn't fail everything.
+    models_to_try = [FAST_GK_MODEL] + [m for m in FALLBACK_MODELS if m != FAST_GK_MODEL]
+
+    for model_name in models_to_try:
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=[prompt, question_text],
+            )
+            if response and getattr(response, "text", None):
+                return response.text.strip()
+        except Exception as e:
+            last_error = e
+            logger.warning(f"GK model {model_name} failed: {e}. Trying fallback...")
+            continue
+
+    logger.error(f"GK fast error, all models failed: {last_error}")
+    return "⚠️ Server busy hai, kripya dobara puchein."
 
 def sanitize_and_prepare(data: dict, shuffle_enabled: bool):
     if not isinstance(data, dict):
@@ -271,11 +305,14 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_settings(user_id)
     timer_display = f"{cfg['timer']}s Countdown" if cfg['timer'] > 0 else "Bina Timer (Answer Click karte hi Next)"
 
+    lang_display = "English 🇬🇧" if cfg["language"] == "en" else "हिंदी 🇮🇳"
+
     text = (
         "⚙️ *Quiz Settings Configuration:*\n\n"
         f"⏱ *Current Mode:* {timer_display}\n"
         f"🔀 *Shuffle Questions:* {'✅ ON' if cfg['shuffle'] else '❌ OFF'}\n"
-        f"⚠️ *Negative Marking (-0.25):* {'✅ ON' if cfg['negative'] else '❌ OFF'}\n\n"
+        f"⚠️ *Negative Marking (-0.25):* {'✅ ON' if cfg['negative'] else '❌ OFF'}\n"
+        f"🌐 *Quiz/GK Language:* {lang_display}\n\n"
         "Neeche buttons se apna pasandida mode select karein:"
     )
 
@@ -290,7 +327,26 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton(f"Shuffle: {'ON ✅' if cfg['shuffle'] else 'OFF ❌'}", callback_data="toggle_shuffle")],
         [InlineKeyboardButton(f"Negative Marking: {'ON ✅' if cfg['negative'] else 'OFF ❌'}", callback_data="toggle_negative")],
+        [
+            InlineKeyboardButton("🇬🇧 English" + (" ✅" if cfg["language"] == "en" else ""), callback_data="set_lang:en"),
+            InlineKeyboardButton("🇮🇳 हिंदी" + (" ✅" if cfg["language"] == "hi" else ""), callback_data="set_lang:hi"),
+        ],
     ])
+    await safe_reply(update.message, text, reply_markup=markup)
+
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cfg = get_settings(user_id)
+    lang_display = "English 🇬🇧" if cfg["language"] == "en" else "हिंदी 🇮🇳"
+
+    text = (
+        f"🌐 *Current Quiz/GK Language:* {lang_display}\n\n"
+        "Neeche button se apni pasandida language choose karein:"
+    )
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🇬🇧 English" + (" ✅" if cfg["language"] == "en" else ""), callback_data="set_lang:en"),
+        InlineKeyboardButton("🇮🇳 हिंदी" + (" ✅" if cfg["language"] == "hi" else ""), callback_data="set_lang:hi"),
+    ]])
     await safe_reply(update.message, text, reply_markup=markup)
 
 async def stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -344,7 +400,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Mode: Direct GK/GS Fast Doubt Answering (1-2s Response)
     if context.user_data.get("mode") == "GK_DOUBT" and text:
-        ans = await asyncio.to_thread(ask_gk_fast, text)
+        ans = await asyncio.to_thread(ask_gk_fast, text, cfg["language"])
         await safe_reply(update.message, f"💡 *Jawab:*\n{md_escape(ans)}", reply_markup=get_main_keyboard())
         return
 
@@ -357,7 +413,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             img_bytes = bytes(await t_file.download_as_bytearray())
 
             part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
-            data = await asyncio.to_thread(parse_with_gemini, part)
+            data = await asyncio.to_thread(parse_with_gemini, part, cfg["language"])
             title, questions = sanitize_and_prepare(data, cfg["shuffle"])
 
             if not questions:
@@ -392,7 +448,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             part = types.Part.from_text(text=content)
-            data = await asyncio.to_thread(parse_with_gemini, part)
+            data = await asyncio.to_thread(parse_with_gemini, part, cfg["language"])
             title, questions = sanitize_and_prepare(data, cfg["shuffle"])
 
             if not questions:
@@ -415,7 +471,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = await update.message.reply_text("⚙️ AI text analyze kar raha hai...")
             try:
                 part = types.Part.from_text(text=text)
-                data = await asyncio.to_thread(parse_with_gemini, part)
+                data = await asyncio.to_thread(parse_with_gemini, part, cfg["language"])
                 title, questions = sanitize_and_prepare(data, cfg["shuffle"])
 
                 if not questions:
@@ -433,7 +489,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
         else:
             # Automatic Fallback: User ne seedha text pucha hai toh instant GK answer de do!
-            ans = await asyncio.to_thread(ask_gk_fast, text)
+            ans = await asyncio.to_thread(ask_gk_fast, text, cfg["language"])
             await safe_reply(update.message, f"💡 *Jawab:*\n{md_escape(ans)}")
 
 async def setup_ready_card(message, context: ContextTypes.DEFAULT_TYPE, user_id: int, title: str, questions: list):
@@ -673,6 +729,17 @@ async def on_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state = "ON ✅ (-0.25)" if cfg["negative"] else "OFF ❌"
             await safe_reply(query.message, f"⚠️ Negative Marking: *{state}*")
 
+        elif data.startswith("set_lang:"):
+            try:
+                lang = data.split(":")[1]
+            except IndexError:
+                return
+            if lang not in ("en", "hi"):
+                return
+            cfg["language"] = lang
+            state = "English 🇬🇧" if lang == "en" else "हिंदी 🇮🇳"
+            await safe_reply(query.message, f"🌐 Quiz/GK Language set to: *{state}*")
+
         elif data.startswith("load_quiz:"):
             try:
                 idx = int(data.split(":")[1])
@@ -716,6 +783,7 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("stop", stop_quiz))
 
     # Error handler
