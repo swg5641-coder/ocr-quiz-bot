@@ -6,7 +6,6 @@ import asyncio
 import random
 import threading
 import time
-import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import (
@@ -32,48 +31,28 @@ from google import genai
 from google.genai import types
 
 # ============================================================
-# 1. 24/7 KEEP-ALIVE SERVER (FOR RENDER)
+# 1. RENDER HEALTH SERVER (LIGHTWEIGHT BACKGROUND THREAD)
 # ============================================================
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        try:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK - ExamQuizBot Live")
-        except Exception:
-            pass
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - QuizBot Live")
 
     def log_message(self, format, *args):
         return
 
-def start_health_server():
-    while True:
-        try:
-            port = int(os.environ.get("PORT", 8080))
-            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-            server.serve_forever()
-        except Exception as e:
-            logging.getLogger(__name__).error(f"Health server crashed: {e}")
-            time.sleep(2)
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
-threading.Thread(target=start_health_server, daemon=True).start()
-
-def keep_alive_ping():
-    time.sleep(30)
-    url = "https://ocr-quiz-bot.onrender.com"
-    while True:
-        try:
-            urllib.request.urlopen(url, timeout=15)
-            logging.getLogger(__name__).info("Keep-alive ping sent.")
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Self-ping notice: {e}")
-        time.sleep(600)
-
-threading.Thread(target=keep_alive_ping, daemon=True).start()
+threading.Thread(target=run_health_server, daemon=True).start()
 
 # ============================================================
-# 2. CONFIGURATION & STATE DEFINITIONS
+# 2. CONFIGURATION & LOGGING
 # ============================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -90,7 +69,7 @@ if GEMINI_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
-        logger.error(f"Gemini init failed: {e}")
+        logger.error(f"Gemini init error: {e}")
 
 TITLE, DESCRIPTION, NEGATIVE, SHUFFLE, TIMER, ADD_QUESTIONS = range(6)
 
@@ -98,18 +77,17 @@ quizzes_store = {}
 active_polls = {}
 
 def md_escape(text: str) -> str:
-    if text is None:
+    if not text:
         return ""
     for ch in ["_", "*", "`", "["]:
         text = str(text).replace(ch, "\\" + ch)
     return text
 
 # ============================================================
-# 3. ROBUST TEXT/REGEX & AI BULK PARSER (UP TO 1000 QUESTIONS)
+# 3. BULK QUESTION PARSER (REGEX + GEMINI FALLBACK)
 # ============================================================
 
 def parse_questions_regex(text: str):
-    """Bina API limit ke standard format questions ko split karne ke liye direct fast parser"""
     questions = []
     blocks = re.split(r'\n(?=(?:Q\d*[\.:\-]|Question\s*\d*[\.:\-]|Sawál|\d+[\.\)]\s+))', text, flags=re.IGNORECASE)
     
@@ -151,17 +129,14 @@ def parse_questions_regex(text: str):
     return questions
 
 def parse_with_gemini(raw_text: str):
-    """Regex fail hone par Gemini 3.5 AI extract karega"""
     if not gemini_client:
         return []
-    prompt = """
-    Extract all multiple choice questions from this text. 
-    Strict JSON format:
-    [
-      {"question": "text", "options": ["A", "B", "C", "D"], "answer": 0}
-    ]
-    Answer is integer index (0-3). Max 4 options. Return ONLY JSON.
-    """
+    prompt = """Extract all multiple choice questions from this text. 
+Strict JSON format:
+[
+  {"question": "text", "options": ["A", "B", "C", "D"], "answer": 0}
+]
+Answer must be integer 0-3. Max 4 options. Return ONLY valid JSON."""
     try:
         res = gemini_client.models.generate_content(
             model="gemini-3.5-flash",
@@ -177,21 +152,20 @@ def parse_with_gemini(raw_text: str):
         return []
 
 # ============================================================
-# 4. CONVERSATION HANDLER: /creat_quiz WORKFLOW
+# 4. CONVERSATION HANDLERS (/creat_quiz)
 # ============================================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "👋 *Welcome to Advance MCQ Bot!*\n\n"
-        "I am a fast and advanced quiz management bot. I help Educators easily create, manage, and automate their quizzes.\n\n"
+    welcome = (
+        "👋 *Welcome to Advance MCQ Quiz Bot!*\n\n"
         "✨ *Main Features:*\n"
-        "🔹 Create quizzes directly from Text or `.txt` files\n"
-        "🔹 **Auto-Split Bulk Quizzes:** 100, 200, 500 questions ko automatic 50-50 ke sets me divide karega\n"
-        "🔹 Set Custom Timers and Negative Marking\n"
-        "🔹 View & Manage via `/my_store`\n\n"
-        "👉 Click /creat_quiz to create your new quiz."
+        "🔹 Create quizzes from Text or `.txt` bulk file\n"
+        "🔹 **Auto-Split Bulk Quizzes:** 100, 200, 500 sawal ko automatic 50-50 sets me divide karega\n"
+        "🔹 Negative marking aur Timer support\n"
+        "🔹 Apne quizzes manage karein: `/my_store`\n\n"
+        "👉 Quiz banane ke liye click karein: /creat_quiz"
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(welcome, parse_mode="Markdown")
 
 async def creat_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["creating_quiz"] = {"questions": []}
@@ -206,7 +180,7 @@ async def quiz_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["creating_quiz"]["title"] = update.message.text.strip()
     kb = ReplyKeyboardMarkup([["Skip ⏭️"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        "📝 *Description:*\n\nProvide a short description for your quiz (or press Skip):",
+        "📝 *Description:*\n\nProvide a short description (or press Skip):",
         parse_mode="Markdown",
         reply_markup=kb
     )
@@ -216,13 +190,9 @@ async def quiz_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     context.user_data["creating_quiz"]["description"] = "" if text == "Skip ⏭️" else text
     
-    neg_kb = ReplyKeyboardMarkup([
-        ["0", "0.25"],
-        ["0.33", "0.66"]
-    ], resize_keyboard=True)
-    
+    neg_kb = ReplyKeyboardMarkup([["0", "0.25"], ["0.33", "0.66"]], resize_keyboard=True)
     await update.message.reply_text(
-        "⚖️ *Negative Marking:*\n\nNiche diye gaye Reply Keyboard se negative marking select karein:",
+        "⚖️ *Negative Marking:*\n\nNegative marking select karein:",
         parse_mode="Markdown",
         reply_markup=neg_kb
     )
@@ -241,7 +211,7 @@ async def quiz_negative(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ], resize_keyboard=True)
     
     await update.message.reply_text(
-        f"✅ *Negative marking set to {val}.*\n\n🔀 *Shuffle Options:*\nChoose how the quiz should be shuffled:",
+        f"✅ *Negative marking set to {val}.*\n\n🔀 *Shuffle Options:*",
         parse_mode="Markdown",
         reply_markup=shuffle_kb
     )
@@ -251,13 +221,9 @@ async def quiz_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sh_text = update.message.text.strip()
     context.user_data["creating_quiz"]["shuffle"] = sh_text
     
-    timer_kb = ReplyKeyboardMarkup([
-        ["10", "15", "30"],
-        ["45", "60", "Bina Timer (0)"]
-    ], resize_keyboard=True)
-    
+    timer_kb = ReplyKeyboardMarkup([["10", "15", "30"], ["45", "60", "Bina Timer (0)"]], resize_keyboard=True)
     await update.message.reply_text(
-        f"✅ *Shuffle type set to {sh_text}.*\n\n⏱ *Timer:*\nNiche se timer duration select karein ya custom number type karein (seconds):",
+        f"✅ *Shuffle type set to {sh_text}.*\n\n⏱ *Timer:*\nNiche se timer duration select karein (seconds):",
         parse_mode="Markdown",
         reply_markup=timer_kb
     )
@@ -272,9 +238,9 @@ async def quiz_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ *Timer set to {timer_val}s.*\n\n"
         "📊 *Send Questions (Bulk or Single):*\n"
-        "Ab aap yahan 50, 100, 200, 300 ya 600 sawal text ya `.txt` file me bhej sakte hain.\n"
-        "*(Note: 50 se zyada sawal hone par bot automatic 50-50 ke parts bana dega)*\n\n"
-        "Jab saare sawal bhej dein, tab niche **/done** dabayein.",
+        "Ab aap yahan 50, 100, 200, 300 ya 600 sawal text ya `.txt` file me bhejein.\n"
+        "*(Note: 50 se zyada questions hone par bot 50-50 ke sets bana dega)*\n\n"
+        "Jab saare sawal bhej chuke hon, tab niche **/done** dabayein.",
         parse_mode="Markdown",
         reply_markup=done_kb
     )
@@ -291,7 +257,7 @@ async def add_questions_handler(update: Update, context: ContextTypes.DEFAULT_TY
         text_content = update.message.text
 
     if not text_content.strip():
-        await update.message.reply_text("⚠️ Kripya text ya `.txt` format me questions bhejein.")
+        await update.message.reply_text("⚠️ Kripya valid text ya `.txt` file upload karein.")
         return ADD_QUESTIONS
 
     status = await update.message.reply_text("⏳ Processing questions...")
@@ -300,14 +266,14 @@ async def add_questions_handler(update: Update, context: ContextTypes.DEFAULT_TY
         extracted = await asyncio.to_thread(parse_with_gemini, text_content)
 
     if not extracted:
-        await status.edit_text("❌ Sawal read nahi ho sake. Kripya format check karein.")
+        await status.edit_text("❌ Sawal read nahi ho sake. Format check karein.")
         return ADD_QUESTIONS
 
     context.user_data["creating_quiz"]["questions"].extend(extracted)
-    total_now = len(context.user_data["creating_quiz"]["questions"])
+    total = len(context.user_data["creating_quiz"]["questions"])
     await status.edit_text(
-        f"✅ *+{len(extracted)} sawal add hue! Total: {total_now} questions.*\n\n"
-        "Aur bhejna chahein toh bhejte rahein, ya finish karne ke liye **/done** dabayein.",
+        f"✅ *+{len(extracted)} sawal add hue! Total: {total} questions.*\n\n"
+        "Aur add karna chahein toh bhejein, warna **/done** dabayein.",
         parse_mode="Markdown"
     )
     return ADD_QUESTIONS
@@ -318,7 +284,7 @@ async def quiz_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     questions = qdata.get("questions", [])
 
     if not questions:
-        await update.message.reply_text("❌ Koi sawal add nahi kiya gaya. Quiz creation cancelled.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("❌ Koi sawal add nahi kiya gaya.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
     if user_id not in quizzes_store:
@@ -329,9 +295,6 @@ async def quiz_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     timer = qdata.get("timer", 15)
     negative = qdata.get("negative", 0.0)
 
-    # ========================================================
-    # 50-50 CHUNKING LOGIC (Splits into 50 Qs sets automatically)
-    # ========================================================
     CHUNK_SIZE = 50
     chunks = [questions[i:i + CHUNK_SIZE] for i in range(0, len(questions), CHUNK_SIZE)]
     
@@ -352,13 +315,13 @@ async def quiz_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         created_list.append(f"• *{md_escape(part_title)}* ({len(chunk)} Qs)")
 
     summary = (
-        f"🎉 *Quiz Successfully Created & Saved!*\n"
+        f"🎉 *Quiz Successfully Created!*\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Total Questions: *{len(questions)}*\n"
         f"📦 Total Sets (50 each): *{len(chunks)}*\n\n"
         + "\n".join(created_list) +
         f"\n━━━━━━━━━━━━━━━━━━━\n"
-        f"Khelne ke liye type karein: /my_store"
+        f"Khelne ke liye click karein: /my_store"
     )
 
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
@@ -371,7 +334,7 @@ async def quiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ============================================================
-# 5. /my_store & QUIZ RUNNER
+# 5. /my_store & QUIZ ENGINE
 # ============================================================
 
 async def my_store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -379,7 +342,7 @@ async def my_store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_quizzes = quizzes_store.get(user_id, [])
     
     if not user_quizzes:
-        await update.message.reply_text("📂 Aapke paas koi saved quiz nahi hai. Naya quiz banane ke liye /creat_quiz dabayein.")
+        await update.message.reply_text("📂 Koi saved quiz nahi mila. Naya quiz banane ke liye /creat_quiz dabayein.")
         return
 
     buttons = []
@@ -387,7 +350,7 @@ async def my_store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton(f"▶️ {q['title']} ({len(q['questions'])} Qs)", callback_data=f"play_quiz:{i}")])
 
     await update.message.reply_text(
-        "📚 *Aapke Saved Quizzes:* (Click karke start karein)",
+        "📚 *Aapke Saved Quizzes:* (Click karke shuru karein)",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -400,7 +363,6 @@ async def on_quiz_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = int(query.data.split(":")[1])
     quiz = quizzes_store.get(user_id, [])[idx]
     
-    # Shuffle application
     questions = [dict(q) for q in quiz["questions"]]
     if "Both" in quiz["shuffle"] or "Question" in quiz["shuffle"]:
         random.shuffle(questions)
@@ -457,7 +419,7 @@ async def send_exam_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Total Questions: *{total}*\n"
             f"✅ Correct: *{correct}*\n"
             f"❌ Wrong: *{wrong}*\n"
-            f"⏳ Time Out/Skipped: *{skipped}*\n"
+            f"⏳ Skipped: *{skipped}*\n"
             f"🎯 Final Marks: *{final_score:.2f} / {total}*\n"
             f"━━━━━━━━━━━━━━━━━━━"
         )
@@ -523,10 +485,13 @@ async def handle_poll_ans(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stop_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("active_quiz", None)
-    await update.message.reply_text("🛑 Active quiz session stop kar diya gaya hai.")
+    await update.message.reply_text("🛑 Active quiz session band kar diya gaya hai.")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception handling update:", exc_info=context.error)
 
 # ============================================================
-# 6. MAIN APPLICATION ENTRY
+# 6. MAIN LAUNCHER
 # ============================================================
 
 def main():
@@ -535,6 +500,7 @@ def main():
         return
 
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(error_handler)
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("creat_quiz", creat_quiz_start)],
@@ -561,7 +527,7 @@ def main():
     app.add_handler(CallbackQueryHandler(run_first_poll, pattern=r"^run_first_poll$"))
     app.add_handler(PollAnswerHandler(handle_poll_ans))
 
-    print("🚀 Exam Quiz Bot with 50-Set Bulk Chunker is Running...")
+    print("🚀 Exam Quiz Bot is Running...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
