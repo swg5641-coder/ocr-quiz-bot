@@ -7,14 +7,17 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import (
     Update,
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Poll,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    PollAnswerHandler,
     ContextTypes,
     filters,
 )
@@ -24,17 +27,17 @@ from google.genai import types
 
 
 # ============================================================
-# 1. RENDER HEALTH-CHECK SERVER (PORT TIMEOUT FIX)
+# 1. RENDER HEALTH-CHECK SERVER (PREVENTS PORT TIMEOUT)
 # ============================================================
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"OK - Bot is Live")
+        self.wfile.write(b"OK - QuizBot is Live")
 
     def log_message(self, format, *args):
-        return  # Render logs ko clean rakhne ke liye HTTP access logs mute
+        return
 
 def start_health_server():
     port = int(os.environ.get("PORT", 8080))
@@ -45,352 +48,442 @@ threading.Thread(target=start_health_server, daemon=True).start()
 
 
 # ============================================================
-# 2. CONFIG & CREDENTIALS
+# 2. CONFIGURATION & CREDENTIALS
 # ============================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# Current stable vision model
 GEMINI_MODEL = "gemini-2.5-flash"
-
-
-# ============================================================
-# 3. LOGGING
-# ============================================================
+QUIZ_TIMER_SECONDS = 15  # Official QuizBot standard timer
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# 4. GEMINI CLIENT
-# ============================================================
 
 if GEMINI_API_KEY:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     gemini_client = None
 
+# Active tracking dictionaries
+active_polls = {}
+saved_quizzes_db = {}
+
 
 # ============================================================
-# 5. AI PROMPT
+# 3. AI PROMPTS
 # ============================================================
 
-MCQ_PROMPT = r"""
-तुम एक बहुत सख्त परीक्षा-प्रश्न निर्माता हो।
-
-तुम्हें एक किताब के पेज की IMAGE दी गई है।
-
-तुम्हारा काम:
-
-1. IMAGE को ध्यान से पढ़ो।
-2. केवल IMAGE में दिखाई देने वाली जानकारी का उपयोग करो।
-3. IMAGE के बाहर की कोई जानकारी जोड़कर प्रश्न मत बनाओ।
-4. IMAGE में दिए गए facts, definitions, names, dates, classifications,
-   scientific terms, examples और statements से अधिकतम अच्छे objective
-   questions बनाओ।
-5. हर प्रश्न के ठीक 4 options होने चाहिए।
-6. केवल एक option सही होना चाहिए।
-7. सही answer का index 0, 1, 2 या 3 होना चाहिए।
-8. प्रश्न हिंदी में बनाओ।
-9. Options हिंदी/अंग्रेजी उसी तरह रखो जैसा किताब में आवश्यक हो।
-10. यदि किसी fact को IMAGE से निश्चित रूप से समझना संभव नहीं है,
-    तो उस fact से प्रश्न मत बनाओ।
-11. कोई duplicate question मत बनाओ।
-12. एक ही fact को बार-बार अलग शब्दों में पूछकर questions की संख्या
-    कृत्रिम रूप से मत बढ़ाओ।
-13. जितने meaningful MCQ वास्तव में IMAGE से बन सकते हैं,
-    उतने ही बनाओ।
-14. अगर 20 बनते हैं तो 20 बनाओ।
-15. अगर केवल 7 अच्छे प्रश्न बनते हैं तो केवल 7 बनाओ।
-16. अनुमान लगाकर प्रश्न मत बनाओ।
-17. सही answer को दोबारा IMAGE के content से verify करो।
-18. विशेष रूप से नाम, वर्ष, वैज्ञानिक नाम और वर्गीकरण में गलती मत करो।
-
-बहुत महत्वपूर्ण:
-
-IMAGE में अगर कोई highlighted/marked text है तो उसे भी पढ़ो,
-लेकिन केवल highlighted text तक सीमित मत रहो।
-पूरे visible page के relevant content से प्रश्न बनाओ।
-
-OUTPUT में केवल valid JSON दो।
-कोई explanation, markdown या ```json block मत देना।
-
-JSON format:
-
+IMAGE_PROMPT = r"""
+Extract all objective questions from this image for a Telegram Quiz.
+Rules:
+1. Valid JSON format only.
+2. Max 4 options per question.
+3. Telegram character constraint: Question max 280 characters, Options max 90 characters.
+4. Correct answer must be index 0, 1, 2, or 3.
+JSON Output Format:
 {
+  "title": "OCR Scanned Quiz",
   "questions": [
     {
-      "question": "प्रश्न",
-      "options": [
-        "विकल्प 1",
-        "विकल्प 2",
-        "विकल्प 3",
-        "विकल्प 4"
-      ],
+      "question": "Question text here",
+      "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
       "answer": 0
     }
   ]
 }
 """
 
+BULK_TEXT_PROMPT = r"""
+Extract and convert all questions from the provided text into a structured multiple choice quiz.
+Rules:
+1. Parse every single question present (e.g. 50, 100, 200+ questions).
+2. Ensure each question has exactly 4 options and 1 correct answer index (0, 1, 2, or 3).
+3. Question text under 280 characters, each option text under 90 characters.
+4. Valid JSON output only.
+JSON Output Format:
+{
+  "title": "Bulk Practice Quiz",
+  "questions": [
+    {
+      "question": "Question text here",
+      "options": ["Opt 1", "Opt 2", "Opt 3", "Opt 4"],
+      "answer": 0
+    }
+  ]
+}
+"""
 
-# ============================================================
-# 6. GEMINI IMAGE -> MCQ
-# ============================================================
-
-def generate_mcqs_from_image(image_bytes: bytes):
+def parse_with_gemini(prompt: str, part: types.Part):
     if not gemini_client:
-        raise RuntimeError("GEMINI_API_KEY सेट नहीं है।")
-
+        raise RuntimeError("GEMINI_API_KEY environment variable missing!")
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type="image/jpeg",
-            ),
-            MCQ_PROMPT,
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        ),
+        contents=[part, prompt],
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-
-    if not response.text:
-        raise RuntimeError("Gemini ने कोई response नहीं दिया।")
-
     return json.loads(response.text)
 
 
-# ============================================================
-# 7. VALIDATE MCQS
-# ============================================================
-
-def validate_mcqs(data):
-    if not isinstance(data, dict):
-        return []
-
-    questions = data.get("questions", [])
-    if not isinstance(questions, list):
-        return []
-
+def sanitize_quiz_data(data: dict):
+    title = str(data.get("title", "Practice Quiz")).strip()[:100]
+    raw_questions = data.get("questions", [])
     valid = []
-    for item in questions:
-        if not isinstance(item, dict):
+
+    for item in raw_questions:
+        q = str(item.get("question", "")).strip()
+        opts = item.get("options", [])
+        ans = item.get("answer", 0)
+
+        if not q or not isinstance(opts, list) or len(opts) < 2:
             continue
 
-        question = str(item.get("question", "")).strip()
-        options = item.get("options", [])
-        answer = item.get("answer", -1)
-
-        if not question or not isinstance(options, list):
-            continue
-
-        options = [str(x).strip() for x in options if str(x).strip()]
-
-        if len(options) != 4:
-            continue
+        clean_opts = [str(x).strip()[:95] for x in opts if str(x).strip()]
+        while len(clean_opts) < 4:
+            clean_opts.append(f"Option {len(clean_opts) + 1}")
+        clean_opts = clean_opts[:4]
 
         try:
-            answer = int(answer)
+            ans = int(ans)
         except Exception:
-            continue
-
-        if answer not in (0, 1, 2, 3):
-            continue
+            ans = 0
+        if ans not in (0, 1, 2, 3):
+            ans = 0
 
         valid.append({
-            "question": question,
-            "options": options,
-            "answer": answer,
+            "question": q[:290],
+            "options": clean_opts,
+            "answer": ans,
         })
-
-    return valid
+    return title, valid
 
 
 # ============================================================
-# 8. HANDLERS
+# 4. COMMAND HANDLERS
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "🎲 *Welcome to Quiz Master Bot!*\n\n"
+        "Ye bot Telegram QuizBot style me kaam karta hai:\n\n"
+        "📸 */scanquiz* - Photo scan karke direct quiz banayein\n"
+        "✍️ */newquiz* - 50, 100, 200+ questions ka text/file bhejkar quiz banayein\n"
+        "📁 */myquizzes* - Apne saved quizzes dekhein aur share karein\n"
+        "🛑 */stop* - Chalu quiz ko turant rokein"
+    )
+    keyboard = [
+        [InlineKeyboardButton("✍️ Create Text Quiz (/newquiz)", callback_data="cmd_newquiz")],
+        [InlineKeyboardButton("📸 Scan Image Quiz (/scanquiz)", callback_data="cmd_scanquiz")],
+        [InlineKeyboardButton("📁 View My Quizzes (/myquizzes)", callback_data="cmd_myquizzes")],
+    ]
+    await update.message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
+async def scanquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["mode"] = "AWAITING_IMAGE"
+    await update.message.reply_text("📸 *Scan Mode Active:*\nAbhi question paper ya book page ki saaf photo bhejiye.", parse_mode="Markdown")
+
+
+async def newquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["mode"] = "AWAITING_TEXT"
     await update.message.reply_text(
-        "📚 *Image → MCQ Quiz Bot*\n\n"
-        "किताब के किसी भी पेज की साफ़ फोटो भेजें।\n\n"
-        "मैं उसी पेज के content से objective questions "
-        "बनाकर Telegram में quiz कराऊँगा।\n\n"
-        "📷 बस फोटो भेजें।",
-        parse_mode="Markdown",
+        "✍️ *Bulk Quiz Mode Active:*\n"
+        "Apne questions text me yahan paste karein ya `.txt` file upload karein (100, 200, 500 jitne chahein).",
+        parse_mode="Markdown"
     )
 
 
-async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = await update.message.reply_text(
-        "🔍 फोटो पढ़ी जा रही है...\n\n"
-        "कृपया थोड़ा इंतज़ार करें।"
-    )
+async def myquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    quizzes = saved_quizzes_db.get(user_id, [])
 
-    try:
-        photo = update.message.photo[-1]
-        telegram_file = await photo.get_file()
-        image_bytes = await telegram_file.download_as_bytearray()
-        image_bytes = bytes(image_bytes)
-    except Exception as e:
-        logger.exception("Telegram image download failed")
-        await status.edit_text(f"❌ फोटो डाउनलोड नहीं हो सकी।\n\nError: {e}")
+    if not quizzes:
+        await update.message.reply_text("📂 Aapke paas koi saved quiz nahi hai. /newquiz ya /scanquiz se banayein.")
         return
 
-    try:
-        await status.edit_text(
-            "🧠 AI पेज को पढ़ रहा है...\n\n"
-            "सिर्फ इसी फोटो के content से MCQ बनाए जा रहे हैं।"
-        )
-        data = await asyncio.to_thread(generate_mcqs_from_image, image_bytes)
-        questions = validate_mcqs(data)
-    except Exception as e:
-        logger.exception("Gemini processing failed")
-        await status.edit_text(f"❌ फोटो से MCQ बनाने में समस्या हुई।\n\nError: {e}")
+    keyboard = []
+    for idx, qz in enumerate(quizzes):
+        keyboard.append([InlineKeyboardButton(f"▶️ {qz['title']} ({len(qz['questions'])} Qs)", callback_data=f"load_quiz:{idx}")])
+
+    await update.message.reply_text("📁 *Aapke Saved Quizzes:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("active_quiz", None)
+    context.user_data.pop("q_index", None)
+    await update.message.reply_text("🛑 Current quiz band ho gaya hai. Naya shuru karne ke liye /start dabayein.")
+
+
+# ============================================================
+# 5. INPUT PROCESSOR (IMAGE / TEXT / TXT FILE)
+# ============================================================
+
+async def handle_incoming_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # 1. PHOTO INPUT
+    if update.message.photo:
+        status = await update.message.reply_text("🔍 Page scan ho raha hai...")
+        try:
+            photo = update.message.photo[-1]
+            t_file = await photo.get_file()
+            img_bytes = bytes(await t_file.download_as_bytearray())
+
+            part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
+            data = await asyncio.to_thread(parse_with_gemini, IMAGE_PROMPT, part)
+            title, questions = sanitize_quiz_data(data)
+
+            if not questions:
+                await status.edit_text("⚠️ Questions clear nahi the. Kripya dusri saaf photo bhejein.")
+                return
+
+            await status.delete()
+            await setup_quiz_session(update.message, context, user_id, title, questions)
+        except Exception as e:
+            logger.exception("OCR Quiz failed")
+            await status.edit_text(f"❌ Error: {e}")
         return
 
-    if not questions:
-        await status.edit_text(
-            "⚠️ इस फोटो से कोई भरोसेमंद MCQ नहीं बन पाया।\n\n"
-            "कृपया साफ़ और सीधी फोटो भेजें।"
-        )
+    # 2. DOCUMENT (.txt file) INPUT
+    if update.message.document:
+        doc = update.message.document
+        if not doc.file_name.endswith((".txt", ".text")):
+            await update.message.reply_text("⚠️ Kripya `.txt` text file upload karein.")
+            return
+
+        status = await update.message.reply_text("⚙️ File se questions parse ho rahe hain...")
+        try:
+            t_file = await doc.get_file()
+            content = (await t_file.download_as_bytearray()).decode("utf-8", errors="ignore")
+            part = types.Part.from_text(text=content)
+            data = await asyncio.to_thread(parse_with_gemini, BULK_TEXT_PROMPT, part)
+            title, questions = sanitize_quiz_data(data)
+
+            if not questions:
+                await status.edit_text("⚠️ File me valid questions nahi mile.")
+                return
+
+            await status.delete()
+            await setup_quiz_session(update.message, context, user_id, title, questions)
+        except Exception as e:
+            logger.exception("File parse failed")
+            await status.edit_text(f"❌ Error: {e}")
         return
 
-    context.user_data["questions"] = questions
+    # 3. TEXT MESSAGE INPUT
+    if update.message.text and not update.message.text.startswith("/"):
+        status = await update.message.reply_text("⚙️ Text analyze ho raha hai...")
+        try:
+            part = types.Part.from_text(text=update.message.text)
+            data = await asyncio.to_thread(parse_with_gemini, BULK_TEXT_PROMPT, part)
+            title, questions = sanitize_quiz_data(data)
+
+            if not questions:
+                await status.edit_text("⚠️ Koi question nahi ban paya. Proper text paste karein.")
+                return
+
+            await status.delete()
+            await setup_quiz_session(update.message, context, user_id, title, questions)
+        except Exception as e:
+            logger.exception("Text quiz failed")
+            await status.edit_text(f"❌ Error: {e}")
+
+
+async def setup_quiz_session(message, context: ContextTypes.DEFAULT_TYPE, user_id: int, title: str, questions: list):
+    if user_id not in saved_quizzes_db:
+        saved_quizzes_db[user_id] = []
+    saved_quizzes_db[user_id].append({"title": title, "questions": questions})
+
+    context.user_data["active_quiz"] = questions
     context.user_data["q_index"] = 0
     context.user_data["score"] = 0
 
-    await status.delete()
-    await update.message.reply_text(
-        f"✅ *{len(questions)} MCQ तैयार हैं!*\n\n"
-        "अब Quiz शुरू करते हैं 👇",
-        parse_mode="Markdown",
+    bot_username = context.bot.username or "Ocrquiz_bot"
+    share_url = f"https://t.me/share/url?url=https://t.me/{bot_username}?start=quiz&text=Play%20Quiz:%20{title}"
+    group_url = f"https://t.me/{bot_username}?startgroup=true"
+
+    share_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Start this quiz", callback_data="start_loaded_quiz")],
+        [InlineKeyboardButton("👥 Start quiz in group", url=group_url)],
+        [InlineKeyboardButton("↗️ Share quiz", url=share_url)],
+    ])
+
+    ready_text = (
+        f"🎲 Get ready for the quiz *'{title}'*\n\n"
+        f"🖊 *{len(questions)} questions*\n"
+        f"⏱ *{QUIZ_TIMER_SECONDS} seconds per question*\n"
+        f"🗳 Votes are *visible* to the quiz owner\n\n"
+        f"🏁 Press the button below when you are ready.\n"
+        f"Send /stop to stop it."
     )
-    await send_question(update.message, context)
+    ready_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("I am ready!", callback_data="start_loaded_quiz")]
+    ])
+
+    await message.reply_text(
+        f"🎲 Quiz *'{title}'*\n🖊 *{len(questions)} questions*  •  ⏱ *{QUIZ_TIMER_SECONDS} sec*",
+        reply_markup=share_markup,
+        parse_mode="Markdown"
+    )
+    await message.reply_text(ready_text, reply_markup=ready_markup, parse_mode="Markdown")
 
 
-async def send_question(message, context: ContextTypes.DEFAULT_TYPE):
-    questions = context.user_data.get("questions", [])
+# ============================================================
+# 6. QUIZ RUNNER (TELEGRAM NATIVE POLLS + TIMER)
+# ============================================================
+
+async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    questions = context.user_data.get("active_quiz", [])
     index = context.user_data.get("q_index", 0)
-
-    if not questions:
-        return
 
     if index >= len(questions):
         score = context.user_data.get("score", 0)
         total = len(questions)
-        percentage = round((score / total) * 100) if total else 0
+        pct = round((score / total) * 100) if total else 0
 
-        await message.reply_text(
+        summary = (
             "🏁 *QUIZ COMPLETE!*\n\n"
-            f"📊 कुल प्रश्न: {total}\n"
-            f"✅ सही: {score}\n"
-            f"❌ गलत: {total - score}\n"
-            f"📈 प्रतिशत: {percentage}%\n\n"
-            "📷 नया पेज भेजकर नया Quiz बना सकते हैं।",
-            parse_mode="Markdown",
+            f"📊 Total Questions: {total}\n"
+            f"✅ Correct: {score}\n"
+            f"❌ Wrong: {total - score}\n"
+            f"📈 Accuracy: {pct}%\n\n"
+            "Naya quiz start karne ke liye /scanquiz ya /newquiz karein."
         )
+        await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode="Markdown")
         return
 
     q = questions[index]
-    keyboard = []
 
-    for i, option in enumerate(q["options"]):
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{chr(65 + i)}. {option}",
-                callback_data=f"answer:{index}:{i}",
-            )
-        ])
-
-    markup = InlineKeyboardMarkup(keyboard)
-    await message.reply_text(
-        f"📝 *प्रश्न {index + 1}/{len(questions)}*\n\n{q['question']}",
-        reply_markup=markup,
-        parse_mode="Markdown",
+    msg = await context.bot.send_poll(
+        chat_id=chat_id,
+        question=f"[{index + 1}/{len(questions)}] {q['question']}",
+        options=q["options"],
+        type=Poll.QUIZ,
+        correct_option_id=q["answer"],
+        open_period=QUIZ_TIMER_SECONDS,
+        is_anonymous=False,
     )
 
+    active_polls[msg.poll.id] = {
+        "chat_id": chat_id,
+        "correct_id": q["answer"],
+        "index": index
+    }
 
-async def answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Auto-advance if timer runs out without answer
+    asyncio.create_task(auto_advance_poll(msg.poll.id, chat_id, index, context))
+
+
+async def auto_advance_poll(poll_id: str, chat_id: int, expected_index: int, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.sleep(QUIZ_TIMER_SECONDS + 1)
+    if poll_id in active_polls:
+        active_polls.pop(poll_id, None)
+        if context.user_data.get("q_index") == expected_index:
+            context.user_data["q_index"] = expected_index + 1
+            await send_next_poll(chat_id, context)
+
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.poll_answer
+    poll_id = answer.poll_id
+
+    if poll_id not in active_polls:
+        return
+
+    poll_info = active_polls.pop(poll_id)
+    selected = answer.option_ids[0] if answer.option_ids else -1
+
+    if selected == poll_info["correct_id"]:
+        context.user_data["score"] = context.user_data.get("score", 0) + 1
+
+    context.user_data["q_index"] = poll_info["index"] + 1
+    await asyncio.sleep(1.2)
+    await send_next_poll(poll_info["chat_id"], context)
+
+
+# ============================================================
+# 7. BUTTON CALLBACK HANDLER
+# ============================================================
+
+async def on_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     data = query.data
-    if not data.startswith("answer:"):
-        return
+    user_id = query.from_user.id
 
-    try:
-        parts = data.split(":")
-        question_index = int(parts[1])
-        selected_index = int(parts[2])
-    except Exception:
-        return
-
-    questions = context.user_data.get("questions", [])
-    current_index = context.user_data.get("q_index", 0)
-
-    if question_index != current_index:
-        await query.answer("यह सवाल पहले ही पूरा हो चुका है.", show_alert=True)
-        return
-
-    if question_index >= len(questions):
-        return
-
-    q = questions[question_index]
-    correct_index = q["answer"]
-
-    if selected_index == correct_index:
-        context.user_data["score"] = context.user_data.get("score", 0) + 1
-        result_text = f"✅ *सही उत्तर!*\n\n✔️ {q['options'][correct_index]}"
-    else:
-        result_text = f"❌ *गलत उत्तर!*\n\n✅ सही उत्तर: *{q['options'][correct_index]}*"
-
-    try:
+    if data == "start_loaded_quiz":
+        if not context.user_data.get("active_quiz"):
+            await query.message.reply_text("⚠️ Koi active quiz nahi mila. Naya banayein.")
+            return
         await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+        await send_next_poll(query.message.chat_id, context)
 
-    await query.message.reply_text(result_text, parse_mode="Markdown")
-    context.user_data["q_index"] = current_index + 1
-    await send_question(query.message, context)
+    elif data == "cmd_newquiz":
+        context.user_data["mode"] = "AWAITING_TEXT"
+        await query.message.reply_text("✍️ Yahan text questions paste karein ya `.txt` file upload karein.")
 
+    elif data == "cmd_scanquiz":
+        context.user_data["mode"] = "AWAITING_IMAGE"
+        await query.message.reply_text("📸 Kitab ke page ki photo bhejiye.")
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled bot error:", exc_info=context.error)
+    elif data == "cmd_myquizzes":
+        quizzes = saved_quizzes_db.get(user_id, [])
+        if not quizzes:
+            await query.message.reply_text("📂 Koi saved quiz nahi mila.")
+            return
+        keyboard = [[InlineKeyboardButton(f"▶️ {qz['title']}", callback_data=f"load_quiz:{i}")] for i, qz in enumerate(quizzes)]
+        await query.message.reply_text("📁 Aapke Quizzes:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("load_quiz:"):
+        idx = int(data.split(":")[1])
+        qz = saved_quizzes_db[user_id][idx]
+        context.user_data["active_quiz"] = qz["questions"]
+        context.user_data["q_index"] = 0
+        context.user_data["score"] = 0
+        ready_markup = InlineKeyboardMarkup([[InlineKeyboardButton("I am ready!", callback_data="start_loaded_quiz")]])
+        await query.message.reply_text(f"✅ Loaded: *{qz['title']}*\n\nPress below when ready:", reply_markup=ready_markup, parse_mode="Markdown")
 
 
 # ============================================================
-# 9. MAIN ENTRY POINT
+# 8. BOT COMMAND REGISTRATION (MENU TOGGLE)
 # ============================================================
+
+async def setup_bot_commands(application: Application):
+    commands = [
+        BotCommand("start", "Main menu open karein"),
+        BotCommand("scanquiz", "Photo scan karke quiz banayein"),
+        BotCommand("newquiz", "100-500 Questions paste/upload karein"),
+        BotCommand("myquizzes", "Saved quizzes dekhein"),
+        BotCommand("stop", "Current quiz terminate karein"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("✅ Menu Commands successfully setup!")
+
 
 def main():
-    if not BOT_TOKEN:
-        print("❌ BOT_TOKEN नहीं मिला! Render Environment me add karein.")
+    if not BOT_TOKEN or not GEMINI_API_KEY:
+        print("❌ Error: BOT_TOKEN ya GEMINI_API_KEY set nahi hai!")
         return
 
-    if not GEMINI_API_KEY:
-        print("❌ GEMINI_API_KEY नहीं मिला! Render Environment me add karein.")
-        return
+    app = Application.builder().token(BOT_TOKEN).post_init(setup_bot_commands).build()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Commands
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("scanquiz", scanquiz_command))
+    app.add_handler(CommandHandler("newquiz", newquiz_command))
+    app.add_handler(CommandHandler("myquizzes", myquizzes_command))
+    app.add_handler(CommandHandler("stop", stop_command))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.add_handler(CallbackQueryHandler(answer_handler, pattern=r"^answer:"))
-    app.add_error_handler(error_handler)
+    # Handlers
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), handle_incoming_messages))
+    app.add_handler(CallbackQueryHandler(on_button_click))
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    print("🤖 Image → MCQ Telegram Bot Started!")
+    print("🤖 QuizBot System Started Successfully!")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-    
