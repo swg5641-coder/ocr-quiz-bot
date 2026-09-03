@@ -6,6 +6,7 @@ import random
 import threading
 import time
 import re
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import (
@@ -29,7 +30,7 @@ from google import genai
 from google.genai import types
 
 # ============================================================
-# 1. RENDER HEALTH-CHECK SERVER (PREVENTS PORT TIMEOUT)
+# 1. RENDER HEALTH-CHECK SERVER & 24/7 SELF-PING
 # ============================================================
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -56,6 +57,21 @@ def start_health_server():
 
 threading.Thread(target=start_health_server, daemon=True).start()
 
+def keep_alive_ping():
+    """Har 10 minute me server ko ping karke Render ko 24 ghante active rakhega."""
+    time.sleep(30)
+    # Aapka exact Render Link set kar diya gaya hai
+    url = "https://ocr-quiz-bot.onrender.com"
+    while True:
+        try:
+            urllib.request.urlopen(url, timeout=15)
+            logging.getLogger(__name__).info("Keep-alive self-ping sent successfully.")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Self-ping notice: {e}")
+        time.sleep(600)
+
+threading.Thread(target=keep_alive_ping, daemon=True).start()
+
 # ============================================================
 # 2. CONFIG & CREDENTIALS
 # ============================================================
@@ -63,8 +79,8 @@ threading.Thread(target=start_health_server, daemon=True).start()
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash"]
-FAST_GK_MODEL = "gemini-2.5-flash-lite"
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash"]
+FAST_GK_MODEL = "gemini-2.5-flash"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -80,24 +96,18 @@ if GEMINI_API_KEY:
         logger.error(f"Failed to init Gemini client: {e}")
         gemini_client = None
 
-# Active tracking structures
-active_polls = {}       # poll_id -> {chat_id, correct_id, index, answered}
-saved_quizzes_db = {}   # user_id -> list of quizzes
-
-# Default User Settings: timer=15 (0 means No Timer / Instant on click), shuffle=True, negative=False
+active_polls = {}
+saved_quizzes_db = {}
 user_settings = {}
 
 def get_settings(user_id):
     if user_id not in user_settings:
-        # language: "en" = English quiz, "hi" = Hindi quiz
         user_settings[user_id] = {"timer": 15, "shuffle": True, "negative": False, "language": "en"}
     if "language" not in user_settings[user_id]:
         user_settings[user_id]["language"] = "en"
     return user_settings[user_id]
 
 def md_escape(text: str) -> str:
-    """Escape characters that break legacy Markdown parsing when embedding
-    dynamic/AI-generated text into a Markdown-formatted message."""
     if text is None:
         return ""
     text = str(text)
@@ -106,7 +116,6 @@ def md_escape(text: str) -> str:
     return text
 
 async def safe_reply(message_or_query, text: str, reply_markup=None, parse_mode="Markdown"):
-    """Reply with Markdown, but never let a formatting error crash the flow."""
     try:
         return await message_or_query.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception as e:
@@ -118,7 +127,7 @@ async def safe_reply(message_or_query, text: str, reply_markup=None, parse_mode=
             return None
 
 # ============================================================
-# 3. PERMANENT SEARCH-BAR KEYBOARD (Chat Box Ke Upar)
+# 3. KEYBOARD
 # ============================================================
 
 def get_main_keyboard():
@@ -166,13 +175,13 @@ def get_extract_prompt(language: str) -> str:
 GK_PROMPT_HI = r"""
 तुम एक बहुत तेज़ और सटीक GK/GS और Static GK शिक्षक हो।
 उपयोगकर्ता द्वारा पूछे गए सामान्य ज्ञान/सामान्य अध्ययन प्रश्न का उत्तर अत्यंत संक्षिप्त, बिंदुवार और सीधे शब्दों में 2-3 वाक्यों में हिंदी में दो।
-अनावश्यक भूमिका मत बनाओ। सीधे मुख्य तथ्य, वर्ष, नाम या कारण बताओ।
+सीधे मुख्य तथ्य, वर्ष, नाम या कारण बताओ।
 """
 
 GK_PROMPT_EN = r"""
 You are a very fast and accurate GK/GS and Static GK teacher.
 Answer the user's General Knowledge / General Studies question in extremely concise, point-wise, plain English in 2-3 sentences.
-Do not add unnecessary intro. Directly state the key facts, year, name, or reason.
+Directly state the key facts, year, name, or reason.
 """
 
 def get_gk_prompt(language: str) -> str:
@@ -206,9 +215,6 @@ def ask_gk_fast(question_text: str, language: str = "hi") -> str:
 
     prompt = get_gk_prompt(language)
     last_error = None
-
-    # Try the fast model first, then fall back through the same models
-    # used for scanning so a single busy/invalid model doesn't fail everything.
     models_to_try = [FAST_GK_MODEL] + [m for m in FALLBACK_MODELS if m != FAST_GK_MODEL]
 
     for model_name in models_to_try:
@@ -237,7 +243,6 @@ def sanitize_and_prepare(data: dict, shuffle_enabled: bool):
         raw_questions = []
 
     valid = []
-
     for item in raw_questions:
         if not isinstance(item, dict):
             continue
@@ -281,7 +286,7 @@ def sanitize_and_prepare(data: dict, shuffle_enabled: bool):
     return title, valid
 
 # ============================================================
-# 5. COMMANDS & BUTTON HANDLERS
+# 5. COMMANDS & BUTTONS
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -294,8 +299,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Aapke typing bar ke upar saare options diye gaye hain:\n"
         "• 📸 *Scan Quiz* - Photo se instant quiz\n"
         "• ✍️ *Text Bulk Quiz* - 50-200 questions paste karein\n"
-        "• 🧠 *GK/GS & Static GK* - Koi bhi GK question puchein (1-2s fast reply)\n"
-        "• ⚙️ *Quiz Settings* - Timer (15s ya No Timer) badlein\n\n"
+        "• 🧠 *GK/GS & Static GK* - Koi bhi GK question puchein (Fast reply)\n"
+        "• ⚙️ *Quiz Settings* - Timer badlein\n\n"
         f"⚙️ *Current Setting:* Timer: *{timer_display}* | Negative: *{'-0.25' if cfg['negative'] else 'OFF'}*"
     )
     await safe_reply(update.message, welcome_text, reply_markup=get_main_keyboard())
@@ -303,8 +308,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     cfg = get_settings(user_id)
-    timer_display = f"{cfg['timer']}s Countdown" if cfg['timer'] > 0 else "Bina Timer (Answer Click karte hi Next)"
-
+    timer_display = f"{cfg['timer']}s Countdown" if cfg['timer'] > 0 else "Bina Timer (Direct Next)"
     lang_display = "English 🇬🇧" if cfg["language"] == "en" else "हिंदी 🇮🇳"
 
     text = (
@@ -339,10 +343,7 @@ async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_settings(user_id)
     lang_display = "English 🇬🇧" if cfg["language"] == "en" else "हिंदी 🇮🇳"
 
-    text = (
-        f"🌐 *Current Quiz/GK Language:* {lang_display}\n\n"
-        "Neeche button se apni pasandida language choose karein:"
-    )
+    text = f"🌐 *Current Quiz/GK Language:* {lang_display}\n\nLanguage choose karein:"
     markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("🇬🇧 English" + (" ✅" if cfg["language"] == "en" else ""), callback_data="set_lang:en"),
         InlineKeyboardButton("🇮🇳 हिंदी" + (" ✅" if cfg["language"] == "hi" else ""), callback_data="set_lang:hi"),
@@ -356,7 +357,7 @@ async def stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Quiz stop kar diya gaya hai.", reply_markup=get_main_keyboard())
 
 # ============================================================
-# 6. INPUT DISPATCHER (PHOTOS, FILES, SEARCH-BAR TEXT)
+# 6. INPUT DISPATCHER
 # ============================================================
 
 async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,7 +368,6 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_settings(user_id)
     text = update.message.text or ""
 
-    # Search Bar Ke Upar Wale Buttons Handle Karna
     if text == "📸 Scan Quiz":
         context.user_data["mode"] = "AWAITING_IMAGE"
         await safe_reply(update.message, "📸 *Book page ya question paper ki saaf photo bhejiye.*")
@@ -378,7 +378,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif text == "🧠 GK/GS & Static GK Doubt":
         context.user_data["mode"] = "GK_DOUBT"
-        await safe_reply(update.message, "🧠 *GK/GS Fast Assistant Active:*\nKoi bhi GK, GS ya Static GK ka sawal yahan type karein, 1-2 second me jawab aayega.")
+        await safe_reply(update.message, "🧠 *GK/GS Fast Assistant Active:*\nKoi bhi GK sawal type karein, instant jawab milega.")
         return
     elif text == "⚙️ Quiz Settings":
         await settings_command(update, context)
@@ -398,13 +398,11 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await stop_quiz(update, context)
         return
 
-    # Mode: Direct GK/GS Fast Doubt Answering (1-2s Response)
     if context.user_data.get("mode") == "GK_DOUBT" and text:
         ans = await asyncio.to_thread(ask_gk_fast, text, cfg["language"])
         await safe_reply(update.message, f"💡 *Jawab:*\n{md_escape(ans)}", reply_markup=get_main_keyboard())
         return
 
-    # 1. PHOTO INPUT
     if update.message.photo:
         status = await update.message.reply_text("🔍 Analyzing page & extracting questions...")
         try:
@@ -417,7 +415,7 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title, questions = sanitize_and_prepare(data, cfg["shuffle"])
 
             if not questions:
-                await status.edit_text("⚠️ Image saaf nahi thi. GK Doubt puchhne ke liye '🧠 GK/GS' button dabayein.")
+                await status.edit_text("⚠️ Questions nahi ban sake. Image saaf bhejein.")
                 return
 
             await status.delete()
@@ -430,12 +428,11 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # 2. DOCUMENT (.txt file)
     if update.message.document:
         doc = update.message.document
         file_name = doc.file_name or ""
         if not file_name.lower().endswith((".txt", ".text")):
-            await update.message.reply_text("⚠️ Kripya `.txt` text file upload karein.")
+            await update.message.reply_text("⚠️ Kripya `.txt` file upload karein.")
             return
 
         status = await update.message.reply_text("⚙️ Bulk questions read ho rahe hain...")
@@ -465,7 +462,6 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # 3. TEXT MESSAGE (Agar user ne text questions bheje hain)
     if text and not text.startswith("/"):
         if context.user_data.get("mode") == "AWAITING_TEXT":
             status = await update.message.reply_text("⚙️ AI text analyze kar raha hai...")
@@ -488,7 +484,6 @@ async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
         else:
-            # Automatic Fallback: User ne seedha text pucha hai toh instant GK answer de do!
             ans = await asyncio.to_thread(ask_gk_fast, text, cfg["language"])
             await safe_reply(update.message, f"💡 *Jawab:*\n{md_escape(ans)}")
 
@@ -498,7 +493,6 @@ async def setup_ready_card(message, context: ContextTypes.DEFAULT_TYPE, user_id:
         return
 
     cfg = get_settings(user_id)
-
     if user_id not in saved_quizzes_db:
         saved_quizzes_db[user_id] = []
     saved_quizzes_db[user_id].append({"title": title, "questions": questions})
@@ -512,7 +506,7 @@ async def setup_ready_card(message, context: ContextTypes.DEFAULT_TYPE, user_id:
     context.user_data["unanswered_count"] = 0
     context.user_data["user_id"] = user_id
 
-    timer_str = f"{cfg['timer']} seconds per question" if cfg['timer'] > 0 else "⚡ Bina Timer (Click karte hi direct agla sawal)"
+    timer_str = f"{cfg['timer']} seconds per question" if cfg['timer'] > 0 else "⚡ Bina Timer (Direct Click Mode)"
 
     ready_text = (
         f"🎲 Get ready for the quiz *'{md_escape(title)}'*\n\n"
@@ -526,11 +520,10 @@ async def setup_ready_card(message, context: ContextTypes.DEFAULT_TYPE, user_id:
     ready_markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("I am ready!", callback_data="start_quiz_session")]
     ])
-
     await safe_reply(message, ready_text, reply_markup=ready_markup)
 
 # ============================================================
-# 7. QUIZ RUNNER (15s TIMER & DIRECT CLICK MODES)
+# 7. QUIZ RUNNER
 # ============================================================
 
 async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -539,7 +532,6 @@ async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     user_id = context.user_data.get("user_id", chat_id)
     cfg = get_settings(user_id)
 
-    # Quiz Complete / no questions available
     if not questions or index >= len(questions):
         final_score = context.user_data.get("score", 0.0)
         correct = context.user_data.get("correct_count", 0)
@@ -548,13 +540,7 @@ async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         total = len(questions)
 
         percentage = max(0, round((correct / total) * 100, 1)) if total else 0
-
-        if percentage >= 75:
-            congrats_header = "🏆 *Congratulations! 👏🎉 You are Rank #1 Outstanding!*"
-        elif percentage >= 40:
-            congrats_header = "👏 *Nice Attempt! Keep it up!*"
-        else:
-            congrats_header = "📚 *Keep Practicing! You will score better next time!*"
+        congrats_header = "🏆 *Outstanding!*" if percentage >= 75 else ("👏 *Nice Attempt!*" if percentage >= 40 else "📚 *Keep Practicing!*")
 
         summary = (
             f"{congrats_header}\n\n"
@@ -566,13 +552,11 @@ async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Skipped/Time Out: *{skipped}*\n"
             f"🎯 Final Score: *{final_score:.2f} / {total}*\n"
             f"📈 Accuracy: *{percentage}%*\n"
-            f"━━━━━━━━━━━━━━━━━━━\n\n"
-            "Naya quiz shuru karne ke liye photo bhejein ya niche diye gaye button use karein."
+            f"━━━━━━━━━━━━━━━━━━━"
         )
         try:
             await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode="Markdown", reply_markup=get_main_keyboard())
-        except Exception as e:
-            logger.warning(f"Summary markdown send failed: {e}")
+        except Exception:
             await context.bot.send_message(chat_id=chat_id, text=summary.replace("*", ""), reply_markup=get_main_keyboard())
 
         context.user_data.pop("active_quiz", None)
@@ -580,15 +564,12 @@ async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         return
 
     q = questions[index]
-
-    # Guard: malformed question entry
     if not isinstance(q, dict) or not q.get("question") or not q.get("options"):
         context.user_data["q_index"] = index + 1
         await send_next_poll(chat_id, context)
         return
 
     timer_sec = cfg["timer"]
-
     options = q.get("options") or []
     if len(options) < 2:
         context.user_data["q_index"] = index + 1
@@ -601,7 +582,6 @@ async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     question_text = f"[{index + 1}/{len(questions)}] {q['question']}"[:290]
 
-    # Agar timer 0 hai toh Telegram open_period parameter nahi bhejenge (No Timer Mode)
     poll_kwargs = {
         "chat_id": chat_id,
         "question": question_text,
@@ -611,14 +591,13 @@ async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         "is_anonymous": False,
     }
 
-    if timer_sec and timer_sec > 0:
+    if timer_sec and timer_sec >= 5:
         poll_kwargs["open_period"] = timer_sec
 
     try:
         msg = await context.bot.send_poll(**poll_kwargs)
     except Exception as e:
         logger.exception(f"send_poll failed at index {index}: {e}")
-        # Skip the broken question instead of stalling the quiz
         context.user_data["q_index"] = index + 1
         await send_next_poll(chat_id, context)
         return
@@ -630,14 +609,12 @@ async def send_next_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         "answered": False
     }
 
-    # Timer Mode me: 15s khatam hote hi agla sawal apne aap
-    if timer_sec and timer_sec > 0:
+    if timer_sec and timer_sec >= 5:
         asyncio.create_task(timer_auto_advance(msg.poll.id, chat_id, index, timer_sec, context))
 
 async def timer_auto_advance(poll_id: str, chat_id: int, expected_index: int, timer_sec: int, context: ContextTypes.DEFAULT_TYPE):
     try:
         await asyncio.sleep(timer_sec)
-
         if poll_id in active_polls:
             poll_info = active_polls.pop(poll_id)
             if not poll_info["answered"] and context.user_data.get("q_index") == expected_index:
@@ -651,20 +628,15 @@ async def timer_auto_advance(poll_id: str, chat_id: int, expected_index: int, ti
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         answer = update.poll_answer
-        if not answer:
-            return
-        poll_id = answer.poll_id
-
-        if poll_id not in active_polls:
+        if not answer or answer.poll_id not in active_polls:
             return
 
-        poll_info = active_polls.pop(poll_id)
+        poll_info = active_polls.pop(answer.poll_id)
         poll_info["answered"] = True
         user_id = answer.user.id if answer.user else poll_info["chat_id"]
         cfg = get_settings(user_id)
 
         selected = answer.option_ids[0] if answer.option_ids else -1
-
         if selected == poll_info["correct_id"]:
             context.user_data["score"] = context.user_data.get("score", 0.0) + 1.0
             context.user_data["correct_count"] = context.user_data.get("correct_count", 0) + 1
@@ -673,7 +645,6 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 context.user_data["score"] = context.user_data.get("score", 0.0) - 0.25
             context.user_data["wrong_count"] = context.user_data.get("wrong_count", 0) + 1
 
-        # Option select karte hi direct agla sawal
         context.user_data["q_index"] = poll_info["index"] + 1
         await asyncio.sleep(0.8)
         await send_next_poll(poll_info["chat_id"], context)
@@ -681,7 +652,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.exception("handle_poll_answer error")
 
 # ============================================================
-# 8. INLINE CALLBACK BUTTONS
+# 8. CALLBACK QUERY HANDLER
 # ============================================================
 
 async def on_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -709,14 +680,10 @@ async def on_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             await send_next_poll(query.message.chat_id, context)
 
-        # Timer selection
         elif data.startswith("set_timer:"):
-            try:
-                sec = int(data.split(":")[1])
-            except (IndexError, ValueError):
-                return
+            sec = int(data.split(":")[1])
             cfg["timer"] = sec
-            status_msg = f"⏱ Timer set to: *{sec} Seconds*" if sec > 0 else "⚡ Set to: *Bina Timer (Click karte hi Direct Next)*"
+            status_msg = f"⏱ Timer set to: *{sec} Seconds*" if sec > 0 else "⚡ Set to: *Bina Timer (Direct Next)*"
             await safe_reply(query.message, status_msg)
 
         elif data == "toggle_shuffle":
@@ -730,43 +697,23 @@ async def on_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_reply(query.message, f"⚠️ Negative Marking: *{state}*")
 
         elif data.startswith("set_lang:"):
-            try:
-                lang = data.split(":")[1]
-            except IndexError:
-                return
-            if lang not in ("en", "hi"):
-                return
+            lang = data.split(":")[1]
             cfg["language"] = lang
             state = "English 🇬🇧" if lang == "en" else "हिंदी 🇮🇳"
-            await safe_reply(query.message, f"🌐 Quiz/GK Language set to: *{state}*")
+            await safe_reply(query.message, f"🌐 Language: *{state}*")
 
         elif data.startswith("load_quiz:"):
-            try:
-                idx = int(data.split(":")[1])
-            except (IndexError, ValueError):
-                await query.message.reply_text("⚠️ Invalid quiz selection.")
-                return
-
+            idx = int(data.split(":")[1])
             user_quizzes = saved_quizzes_db.get(user_id, [])
-            if idx < 0 or idx >= len(user_quizzes):
-                await query.message.reply_text("⚠️ Ye quiz ab available nahi hai.")
-                return
-
-            qz = user_quizzes[idx]
-            title, questions = sanitize_and_prepare(
-                {"title": qz.get("title"), "questions": qz.get("questions", [])},
-                cfg["shuffle"],
-            )
-            await setup_ready_card(query.message, context, user_id, title, questions)
+            if 0 <= idx < len(user_quizzes):
+                qz = user_quizzes[idx]
+                title, questions = sanitize_and_prepare(qz, cfg["shuffle"])
+                await setup_ready_card(query.message, context, user_id, title, questions)
     except Exception:
         logger.exception("on_button_click error")
-        try:
-            await query.message.reply_text("⚠️ Kuch gadbad ho gayi, dobara try karein.")
-        except Exception:
-            pass
 
 # ============================================================
-# 9. MAIN APP INITIALIZER
+# 9. MAIN
 # ============================================================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -774,27 +721,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN or not GEMINI_API_KEY:
-        print("❌ Error: BOT_TOKEN ya GEMINI_API_KEY set nahi hai!")
+        print("❌ BOT_TOKEN ya GEMINI_API_KEY set nahi hai!")
         return
 
-    # Default Menu Toggle button ko bypass karke standard Application build
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("stop", stop_quiz))
 
-    # Error handler
     app.add_error_handler(error_handler)
 
-    # Handlers for search bar keyboard buttons, text, photos & polls
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), handle_inputs))
     app.add_handler(CallbackQueryHandler(on_button_click))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    print("🤖 Ultra-Fast QuizBot & GK Assistant Running...")
+    print("🤖 Ultra-Fast QuizBot & GK Assistant Running 24/7...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
