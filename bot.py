@@ -79,7 +79,7 @@ threading.Thread(target=keep_alive_ping, daemon=True).start()
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash"]
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 FAST_GK_MODEL = "gemini-2.5-flash"
 
 logging.basicConfig(
@@ -207,7 +207,7 @@ def parse_with_gemini(part: types.Part, language: str = "en"):
             logger.warning(f"Model {model_name} failed: {e}. Trying fallback...")
             continue
 
-    raise RuntimeError(f"All AI models busy: {last_error}")
+    raise RuntimeError(f"All AI models failed: {last_error}")
 
 def ask_gk_fast(question_text: str, language: str = "hi") -> str:
     if not gemini_client:
