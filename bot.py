@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import (
     Update,
@@ -22,18 +24,39 @@ from google.genai import types
 
 
 # ============================================================
-# CONFIG
+# 1. RENDER HEALTH-CHECK SERVER (PORT TIMEOUT FIX)
 # ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK - Bot is Live")
+
+    def log_message(self, format, *args):
+        return  # Render logs ko clean rakhne ke liye HTTP access logs mute
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+threading.Thread(target=start_health_server, daemon=True).start()
+
+
+# ============================================================
+# 2. CONFIG & CREDENTIALS
+# ============================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Current Gemini vision model
-GEMINI_MODEL = "gemini-3.8-flash"
+# Current stable vision model
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 # ============================================================
-# LOGGING
+# 3. LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -45,26 +68,17 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# GEMINI CLIENT
+# 4. GEMINI CLIENT
 # ============================================================
 
 if GEMINI_API_KEY:
-    gemini_client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     gemini_client = None
 
 
 # ============================================================
-# USER QUIZ DATA
-# ============================================================
-
-# context.user_data में हर user का अलग quiz रहेगा.
-
-
-# ============================================================
-# AI PROMPT
+# 5. AI PROMPT
 # ============================================================
 
 MCQ_PROMPT = r"""
@@ -127,15 +141,12 @@ JSON format:
 
 
 # ============================================================
-# GEMINI IMAGE -> MCQ
+# 6. GEMINI IMAGE -> MCQ
 # ============================================================
 
 def generate_mcqs_from_image(image_bytes: bytes):
-
     if not gemini_client:
-        raise RuntimeError(
-            "GEMINI_API_KEY सेट नहीं है।"
-        )
+        raise RuntimeError("GEMINI_API_KEY सेट नहीं है।")
 
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL,
@@ -152,61 +163,37 @@ def generate_mcqs_from_image(image_bytes: bytes):
     )
 
     if not response.text:
-        raise RuntimeError(
-            "Gemini ने कोई response नहीं दिया।"
-        )
+        raise RuntimeError("Gemini ने कोई response नहीं दिया।")
 
     return json.loads(response.text)
 
 
 # ============================================================
-# VALIDATE MCQS
+# 7. VALIDATE MCQS
 # ============================================================
 
 def validate_mcqs(data):
-
     if not isinstance(data, dict):
         return []
 
     questions = data.get("questions", [])
-
     if not isinstance(questions, list):
         return []
 
     valid = []
-
     for item in questions:
-
         if not isinstance(item, dict):
             continue
 
-        question = str(
-            item.get("question", "")
-        ).strip()
+        question = str(item.get("question", "")).strip()
+        options = item.get("options", [])
+        answer = item.get("answer", -1)
 
-        options = item.get(
-            "options",
-            []
-        )
-
-        answer = item.get(
-            "answer",
-            -1
-        )
-
-        if not question:
+        if not question or not isinstance(options, list):
             continue
 
-        if not isinstance(options, list):
-            continue
+        options = [str(x).strip() for x in options if str(x).strip()]
 
-        options = [
-            str(x).strip()
-            for x in options
-            if str(x).strip()
-        ]
-
-        # Exactly 4 options
         if len(options) != 4:
             continue
 
@@ -218,26 +205,20 @@ def validate_mcqs(data):
         if answer not in (0, 1, 2, 3):
             continue
 
-        valid.append(
-            {
-                "question": question,
-                "options": options,
-                "answer": answer,
-            }
-        )
+        valid.append({
+            "question": question,
+            "options": options,
+            "answer": answer,
+        })
 
     return valid
 
 
 # ============================================================
-# START
+# 8. HANDLERS
 # ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📚 *Image → MCQ Quiz Bot*\n\n"
         "किताब के किसी भी पेज की साफ़ फोटो भेजें।\n\n"
@@ -248,152 +229,65 @@ async def start(
     )
 
 
-# ============================================================
-# IMAGE HANDLER
-# ============================================================
-
-async def handle_image(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text(
         "🔍 फोटो पढ़ी जा रही है...\n\n"
         "कृपया थोड़ा इंतज़ार करें।"
     )
 
     try:
-
-        # Highest resolution Telegram photo
         photo = update.message.photo[-1]
-
         telegram_file = await photo.get_file()
-
         image_bytes = await telegram_file.download_as_bytearray()
-
         image_bytes = bytes(image_bytes)
-
     except Exception as e:
-
-        logger.exception(
-            "Telegram image download failed"
-        )
-
-        await status.edit_text(
-            "❌ फोटो डाउनलोड नहीं हो सकी।\n\n"
-            f"Error: {e}"
-        )
-
+        logger.exception("Telegram image download failed")
+        await status.edit_text(f"❌ फोटो डाउनलोड नहीं हो सकी।\n\nError: {e}")
         return
 
-    # --------------------------------------------------------
-    # AI PROCESSING
-    # --------------------------------------------------------
-
     try:
-
         await status.edit_text(
             "🧠 AI पेज को पढ़ रहा है...\n\n"
             "सिर्फ इसी फोटो के content से MCQ बनाए जा रहे हैं।"
         )
-
-        data = await asyncio.to_thread(
-            generate_mcqs_from_image,
-            image_bytes
-        )
-
+        data = await asyncio.to_thread(generate_mcqs_from_image, image_bytes)
         questions = validate_mcqs(data)
-
     except Exception as e:
-
-        logger.exception(
-            "Gemini processing failed"
-        )
-
-        await status.edit_text(
-            "❌ फोटो से MCQ बनाने में समस्या हुई।\n\n"
-            f"Error: {e}"
-        )
-
+        logger.exception("Gemini processing failed")
+        await status.edit_text(f"❌ फोटो से MCQ बनाने में समस्या हुई।\n\nError: {e}")
         return
 
-    # --------------------------------------------------------
-    # NO QUESTIONS
-    # --------------------------------------------------------
-
     if not questions:
-
         await status.edit_text(
             "⚠️ इस फोटो से कोई भरोसेमंद MCQ नहीं बन पाया।\n\n"
             "कृपया साफ़ और सीधी फोटो भेजें।"
         )
-
         return
-
-    # --------------------------------------------------------
-    # SAVE QUIZ
-    # --------------------------------------------------------
 
     context.user_data["questions"] = questions
     context.user_data["q_index"] = 0
     context.user_data["score"] = 0
 
-    # --------------------------------------------------------
-    # START QUIZ
-    # --------------------------------------------------------
-
     await status.delete()
-
     await update.message.reply_text(
         f"✅ *{len(questions)} MCQ तैयार हैं!*\n\n"
         "अब Quiz शुरू करते हैं 👇",
         parse_mode="Markdown",
     )
-
-    await send_question(
-        update.message,
-        context
-    )
+    await send_question(update.message, context)
 
 
-# ============================================================
-# SEND QUESTION
-# ============================================================
-
-async def send_question(
-    message,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    questions = context.user_data.get(
-        "questions",
-        []
-    )
-
-    index = context.user_data.get(
-        "q_index",
-        0
-    )
+async def send_question(message, context: ContextTypes.DEFAULT_TYPE):
+    questions = context.user_data.get("questions", [])
+    index = context.user_data.get("q_index", 0)
 
     if not questions:
         return
 
-    # --------------------------------------------------------
-    # QUIZ FINISHED
-    # --------------------------------------------------------
-
     if index >= len(questions):
-
-        score = context.user_data.get(
-            "score",
-            0
-        )
-
+        score = context.user_data.get("score", 0)
         total = len(questions)
-
-        percentage = round(
-            (score / total) * 100
-        ) if total else 0
+        percentage = round((score / total) * 100) if total else 0
 
         await message.reply_text(
             "🏁 *QUIZ COMPLETE!*\n\n"
@@ -404,20 +298,12 @@ async def send_question(
             "📷 नया पेज भेजकर नया Quiz बना सकते हैं।",
             parse_mode="Markdown",
         )
-
         return
 
     q = questions[index]
-
     keyboard = []
 
-    for i, option in enumerate(
-        q["options"]
-    ):
-
-        # Callback में केवल छोटा index भेजें
-        # ताकि Telegram callback_data limit से समस्या न हो।
-
+    for i, option in enumerate(q["options"]):
         keyboard.append([
             InlineKeyboardButton(
                 f"{chr(65 + i)}. {option}",
@@ -425,216 +311,86 @@ async def send_question(
             )
         ])
 
-    markup = InlineKeyboardMarkup(
-        keyboard
-    )
-
+    markup = InlineKeyboardMarkup(keyboard)
     await message.reply_text(
-        f"📝 *प्रश्न {index + 1}/{len(questions)}*\n\n"
-        f"{q['question']}",
+        f"📝 *प्रश्न {index + 1}/{len(questions)}*\n\n{q['question']}",
         reply_markup=markup,
         parse_mode="Markdown",
     )
 
 
-# ============================================================
-# ANSWER HANDLER
-# ============================================================
-
-async def answer_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
     await query.answer()
 
     data = query.data
-
     if not data.startswith("answer:"):
         return
 
     try:
-
         parts = data.split(":")
-
         question_index = int(parts[1])
         selected_index = int(parts[2])
-
     except Exception:
-
         return
 
-    questions = context.user_data.get(
-        "questions",
-        []
-    )
+    questions = context.user_data.get("questions", [])
+    current_index = context.user_data.get("q_index", 0)
 
-    current_index = context.user_data.get(
-        "q_index",
-        0
-    )
-
-    # पुराने button पर click रोकना
     if question_index != current_index:
-        await query.answer(
-            "यह सवाल पहले ही पूरा हो चुका है।",
-            show_alert=True,
-        )
+        await query.answer("यह सवाल पहले ही पूरा हो चुका है.", show_alert=True)
         return
 
     if question_index >= len(questions):
         return
 
     q = questions[question_index]
-
     correct_index = q["answer"]
 
-    # --------------------------------------------------------
-    # CORRECT
-    # --------------------------------------------------------
-
     if selected_index == correct_index:
-
-        context.user_data["score"] = (
-            context.user_data.get(
-                "score",
-                0
-            ) + 1
-        )
-
-        result_text = (
-            "✅ *सही उत्तर!*\n\n"
-            f"✔️ {q['options'][correct_index]}"
-        )
-
-    # --------------------------------------------------------
-    # WRONG
-    # --------------------------------------------------------
-
+        context.user_data["score"] = context.user_data.get("score", 0) + 1
+        result_text = f"✅ *सही उत्तर!*\n\n✔️ {q['options'][correct_index]}"
     else:
-
-        result_text = (
-            "❌ *गलत उत्तर!*\n\n"
-            f"✅ सही उत्तर: "
-            f"*{q['options'][correct_index]}*"
-        )
-
-    # --------------------------------------------------------
-    # REMOVE OLD BUTTONS
-    # --------------------------------------------------------
+        result_text = f"❌ *गलत उत्तर!*\n\n✅ सही उत्तर: *{q['options'][correct_index]}*"
 
     try:
-
-        await query.edit_message_reply_markup(
-            reply_markup=None
-        )
-
+        await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    await query.message.reply_text(
-        result_text,
-        parse_mode="Markdown",
-    )
+    await query.message.reply_text(result_text, parse_mode="Markdown")
+    context.user_data["q_index"] = current_index + 1
+    await send_question(query.message, context)
 
-    # Next question
-    context.user_data["q_index"] = (
-        current_index + 1
-    )
 
-    await send_question(
-        query.message,
-        context
-    )
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled bot error:", exc_info=context.error)
 
 
 # ============================================================
-# ERROR HANDLER
-# ============================================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    logger.exception(
-        "Unhandled bot error:",
-        exc_info=context.error
-    )
-
-
-# ============================================================
-# MAIN
+# 9. MAIN ENTRY POINT
 # ============================================================
 
 def main():
-
     if not BOT_TOKEN:
-
-        print(
-            "❌ BOT_TOKEN नहीं मिला!"
-        )
-
+        print("❌ BOT_TOKEN नहीं मिला! Render Environment me add karein.")
         return
 
     if not GEMINI_API_KEY:
-
-        print(
-            "❌ GEMINI_API_KEY नहीं मिला!"
-        )
-
+        print("❌ GEMINI_API_KEY नहीं मिला! Render Environment me add karein.")
         return
 
-    app = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # /start
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    app.add_handler(CallbackQueryHandler(answer_handler, pattern=r"^answer:"))
+    app.add_error_handler(error_handler)
 
-    # Photo
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            handle_image
-        )
-    )
+    print("🤖 Image → MCQ Telegram Bot Started!")
+    app.run_polling(drop_pending_updates=True)
 
-    # Answer buttons
-    app.add_handler(
-        CallbackQueryHandler(
-            answer_handler,
-            pattern=r"^answer:"
-        )
-    )
-
-    # Error
-    app.add_error_handler(
-        error_handler
-    )
-
-    print(
-        "🤖 Image → MCQ Telegram Bot Started!"
-    )
-
-    app.run_polling(
-        drop_pending_updates=True
-    )
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
+    
